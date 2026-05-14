@@ -7,7 +7,7 @@ set -euo pipefail
 
 # COVID genome
 curl -L \
-  "https://figshare.com/ndownloader/files/22700666" \
+  "https://ndownloader.figshare.com/files/22700666" \
   -o covid.fasta
 
 # E. coli genome
@@ -30,7 +30,6 @@ with open("random.fasta", "w") as f:
 
     seq = ''.join(random.choices(bases, k=length))
 
-    # wrap lines at 80 chars
     for i in range(0, length, 80):
         f.write(seq[i:i+80] + "\n")
 PY
