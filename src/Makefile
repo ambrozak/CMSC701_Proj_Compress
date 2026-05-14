@@ -1,18 +1,25 @@
-CXX = g++
-CXXFLAGS = -O3 -std=c++17 -march=native -ffast-math
-LDFLAGS = -lm
-
-TARGETS = compress query
-
-all: $(TARGETS)
-
-compress: compress.cpp
-	$(CXX) $(CXXFLAGS) -o compress compress.cpp $(LDFLAGS)
-
-query: query.cpp
-	$(CXX) $(CXXFLAGS) -o query query.cpp $(LDFLAGS)
-
-clean:
-	rm -f $(TARGETS)
+CXX      = g++
+CXXFLAGS = -std=c++17 -O3 -march=native -Wall -Wextra
 
 .PHONY: all clean
+
+all: build_index query_index build_plain_index query_plain_index naive_gt
+
+build_index: build_index.cpp
+	$(CXX) $(CXXFLAGS) -o build_index build_index.cpp
+
+query_index: query_index.cpp
+	$(CXX) $(CXXFLAGS) -o query_index query_index.cpp
+
+
+naive_gt: naive_gt.cpp
+	$(CXX) $(CXXFLAGS) -o naive_gt naive_gt.cpp
+
+build_plain_index: build_plain_index.cpp
+	$(CXX) $(CXXFLAGS) -o build_plain_index build_plain_index.cpp
+
+query_plain_index: query_plain_index.cpp
+	$(CXX) $(CXXFLAGS) -o query_plain_index query_plain_index.cpp
+
+clean:
+	rm -f build_index query_index build_plain_index query_plain_index
