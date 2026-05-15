@@ -69,7 +69,7 @@ bases = "ACGT"
 
 with open("randomqueries.txt", "w") as f:
     for _ in range(NUM_QUERIES):
-        q = ''.join(random.choices(bases, k=15))
+        q = ''.join(random.choices(bases, k=10))
         f.write(q + "\n")
 
 print("Done.")
