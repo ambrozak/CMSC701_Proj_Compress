@@ -1,27 +1,41 @@
 /**
- * query_index.cpp  —  Query a grammar-compressed FM-index (v5)
+ * query_index.cpp  —  Query a grammar-compressed FM-index (v6)
  *
- * LF mapping:
- *   arr         = logicalRow - 1
- *   sym         = BWT[arr]
- *   newLogRow   = C[sym] + rankSym(sym, arr)   // rank in [0, arr), exclusive
+ * Changes from v5 → v6 (all motivated by 0-based row indexing):
  *
- * SA sample lookup (bitvector popcount-rank):
- *   Check bit arr in saBv. If set, rank = popcount(saBv[0..arr]),
+ *   FMIndex:
+ *     sentinelRow field removed (was always 0).
+ *
+ *   loadIndex:
+ *     Updated magic to FMIDX\x06; sentinelRow no longer read.
+ *
+ *   locateRow:
+ *     arr = cur (not cur-1).  The LF step is now the standard 0-based formula:
+ *       cur = C[sym] + rankSym(sym, cur)
+ *     where rankSym counts occurrences in [0, cur) — no -1 adjustment.
+ *     maxSteps fixed: only SA_SAMPLE_RATE steps are ever needed (each LF step
+ *     decrements the compressed SA value by 1, so we reach a sample in at most
+ *     SA_SAMPLE_RATE steps), replacing the broken "(int)compLen + ..." bound.
+ *
+ *   bwtAt:
+ *     Assertion relaxed to sym <= numSymbols (allows 0 = sentinel char,
+ *     though in practice we always return before reaching that row).
+ *
+ *   backwardSearch:
+ *     Every LF interval step changed from
+ *       C[s] + rankSym(s, lo-1),  C[s] + rankSym(s, hi-1)
+ *     to
+ *       C[s] + rankSym(s, lo),    C[s] + rankSym(s, hi)
+ *     because lo/hi are now 0-based row numbers and rankSym(s, i) already
+ *     counts occurrences in [0, i) exclusive — no adjustment needed.
+ *
+ * LF mapping (0-based):
+ *   sym     = BWT[row]
+ *   newRow  = C[sym] + rankSym(sym, row)   // rank in [0, row), exclusive
+ *
+ * SA sample lookup:
+ *   Check bit row in saBv.  If set, rank = popcount(saBv[0..row]),
  *   result = saVals[rank-1] + offset.
- *
- * After query compression, ambiguous symbols are decompressed back to
- * terminals so the final query is a mix of large non-ambiguous grammar
- * symbols and individual terminals (in ambiguous zones).
- *
- * Non-ambiguous optimizations:
- *   1) Non-ambiguous query symbols match F-column symbols by identity,
- *      no terminal-by-terminal walk needed.
- *   2) LF-step for non-ambiguous symbols goes directly to C[sym]+rank,
- *      no scanning all F-column symbols for compatible expansions.
- *   3) If walking terminal-by-terminal inside an F-column symbol and we
- *      reach a non-ambiguous query symbol before exhausting the expansion,
- *      we know it's a mismatch and prune the branch.
  */
 
 #include <algorithm>
@@ -41,7 +55,7 @@ struct Rule { uint32_t left, right; };
 
 struct FMIndex {
     int      symbolBits;
-    uint64_t refLen, compLen, sentinelRow;
+    uint64_t refLen, compLen;   // sentinelRow removed
     uint32_t numSymbols;
     vector<Rule>             rules;
     vector<uint64_t>         C;
@@ -60,13 +74,14 @@ static FMIndex loadIndex(const string& path)
     ifstream f(path,ios::binary);
     if(!f){cerr<<"Cannot open "<<path<<"\n";exit(1);}
     char magic[7]; f.read(magic,7);
-    if(strncmp(magic,"FMIDX\x05",6)!=0){cerr<<"Bad magic (expected v5)\n";exit(1);}
+    // v6: sentinelRow removed from file
+    if(strncmp(magic,"FMIDX\x06",6)!=0){cerr<<"Bad magic (expected v6)\n";exit(1);}
     FMIndex idx;
     idx.symbolBits=(int)r32(f);
     idx.refLen=r64(f); idx.compLen=r64(f);
     uint32_t nRules=r32(f);
     SA_SAMPLE_RATE=(int)r32(f);
-    idx.sentinelRow=r64(f);
+    // sentinelRow NOT read (removed in v6)
     idx.numSymbols=r32(f);
     idx.exps.resize(idx.numSymbols+1);
     for(uint32_t i=1;i<=idx.numSymbols;i++){
@@ -92,7 +107,10 @@ static FMIndex loadIndex(const string& path)
     return idx;
 }
 
-// Wavelet tree
+// ---------------------------------------------------------------------------
+// Wavelet tree  (unchanged)
+// ---------------------------------------------------------------------------
+
 static inline uint64_t wt_rank1(const FMIndex& idx, int l, uint64_t i)
 {
     if(i==0) return 0;
@@ -126,38 +144,59 @@ static uint32_t bwtAt(const FMIndex& idx, uint64_t r)
         if(bit==0) pos=pos-rb;
         else{uint64_t zeros=n-wt_rank1(idx,l,n);pos=zeros+ra-1;}
     }
-    assert(sym>=1&&sym<=idx.numSymbols);
+    // sym==0 means sentinel char; locateRow never reaches that row in practice
+    // because it is always sampled (compSA[i]=0, 0%rate==0).
+    assert(sym<=idx.numSymbols);
     return sym;
 }
 
-// SA sample lookup
-static inline uint64_t bvPopcount(const vector<uint64_t>& bv, uint64_t arr)
+// ---------------------------------------------------------------------------
+// SA sample lookup  (unchanged)
+// ---------------------------------------------------------------------------
+
+static inline uint64_t bvPopcount(const vector<uint64_t>& bv, uint64_t row)
 {
-    uint64_t i=arr+1, cnt=0, full=i/64;
+    uint64_t i=row+1, cnt=0, full=i/64;
     for(uint64_t w=0;w<full;w++) cnt+=__builtin_popcountll(bv[w]);
     uint64_t rem=i%64;
     if(rem) cnt+=__builtin_popcountll(bv[full]&((1ULL<<rem)-1ULL));
     return cnt;
 }
 
-static uint64_t locateRow(const FMIndex& idx, uint64_t logRow)
+// ---------------------------------------------------------------------------
+// locateRow  (v6: 0-based, fixed maxSteps)
+// ---------------------------------------------------------------------------
+//
+// Walk LF until we hit a sampled row.  In 0-based indexing:
+//   - The BWT array is indexed directly by row (no -1 adjustment).
+//   - LF(row) = C[BWT[row]] + rankSym(BWT[row], row)
+//             where rankSym counts [0, row) exclusive.
+//
+// At most SA_SAMPLE_RATE LF steps are needed: each step decrements the
+// underlying compressed SA value by 1 (mod compLen), so within SA_SAMPLE_RATE
+// steps we reach a compressed position that is a multiple of SA_SAMPLE_RATE
+// and therefore sampled.  The old bound "(int)compLen + rate + 2" was both
+// wrong (int overflow for large refs) and unnecessarily large.
+
+static uint64_t locateRow(const FMIndex& idx, uint64_t row)
 {
-    uint64_t offset=0, cur=logRow;
-    int maxSteps=(int)idx.compLen+SA_SAMPLE_RATE+2;
-    for(int steps=0;steps<=maxSteps;steps++){
-        uint64_t arr=cur-1;
-        if((idx.saBv[arr/64]>>(arr%64))&1ULL){
-            uint64_t rank=bvPopcount(idx.saBv,arr);
-            uint64_t base=idx.saVals[rank-1];
-            return (base+offset)%idx.refLen;
+    uint64_t offset=0, cur=row;
+    for(int steps=0; steps<=SA_SAMPLE_RATE+2; steps++){
+        if((idx.saBv[cur/64]>>(cur%64))&1ULL){
+            uint64_t rank=bvPopcount(idx.saBv,cur);
+            return (idx.saVals[rank-1]+offset)%idx.refLen;
         }
-        uint32_t sym=bwtAt(idx,arr);
+        uint32_t sym=bwtAt(idx,cur);
         offset+=idx.exps[sym].size();
-        cur=idx.C[sym]+rankSym(idx,sym,arr);
+        cur=idx.C[sym]+rankSym(idx,sym,cur);   // 0-based LF: no -1
     }
-    cerr<<"ERROR: LF walk limit reached at logRow="<<logRow<<"\n";
+    cerr<<"ERROR: LF walk limit reached at row="<<row<<"\n";
     return UINT64_MAX;
 }
+
+// ---------------------------------------------------------------------------
+// Query compression helpers  (unchanged)
+// ---------------------------------------------------------------------------
 
 static inline uint32_t baseToSym(char c)
 {
@@ -189,15 +228,11 @@ static vector<QSym> compressQuery(const vector<uint32_t>& qRem,
         vector<QSym> next; next.reserve(cur.size());
         size_t i=0,n=cur.size();
         while(i+1<n){
-            if(cur[i].sym==c1 && cur[i+1].amb) {
-                cur[i].amb = true;
-            }
-            if(cur[i+1].sym==c2 && cur[i].amb) {
-                cur[i+1].amb = true;
-            }
+            if(cur[i].sym==c1 && cur[i+1].amb) cur[i].amb=true;
+            if(cur[i+1].sym==c2 && cur[i].amb) cur[i+1].amb=true;
             i++;
         }
-        i = 0;
+        i=0;
         while(i<n){
             if(i+1<n&&cur[i].sym==c1&&cur[i+1].sym==c2){
                 if(cur[i].amb){cur[i+1].amb=true;next.push_back(cur[i]);i++;}
@@ -210,237 +245,134 @@ static vector<QSym> compressQuery(const vector<uint32_t>& qRem,
     return cur;
 }
 
-static string qsymToString(const vector<QSym>& v, const FMIndex& idx)
+static vector<QSym> decompressAmbiguous(const vector<QSym>& cq,
+                                         const FMIndex& idx,
+                                         const vector<uint32_t>& termMap)
 {
-    string out;
-
-    auto appendSym = [&](uint32_t sym) {
-        const auto& exp = idx.exps[sym];
-
-        // Single-terminal symbols: print DNA character
-        if(exp.size() == 1){
-            switch(exp[0]){
-                case 1: out += 'A'; break;
-                case 2: out += 'C'; break;
-                case 3: out += 'G'; break;
-                case 4: out += 'T'; break;
-                default:
-                    out += '?';
-                    break;
-            }
-        } else {
-            out += "sym";
-            out += to_string(sym);
-        }
-    };
-
-    for(size_t i = 0; i < v.size(); i++){
-        if(i) out += ' ';
-
-        appendSym(v[i].sym);
-
-        if(v[i].amb)
-            out += "*";
-    }
-
-    return out;
-}
-
-static string fullyDecompressQSyms(const vector<QSym>& v, const FMIndex& idx)
-{
-    string out;
-
-    for(const auto& qs : v){
-        const auto& exp = idx.exps[qs.sym];
-
-        for(uint8_t t : exp){
-            switch(t){
-                case 1: out += 'A'; break;
-                case 2: out += 'C'; break;
-                case 3: out += 'G'; break;
-                case 4: out += 'T'; break;
-                default:
-                    out += '?';
-                    break;
+    vector<QSym> result; result.reserve(cq.size());
+    for(const auto& qs : cq){
+        if(!qs.amb){ result.push_back(qs); }
+        else{
+            const auto& exp=idx.exps[qs.sym];
+            for(uint8_t t:exp){
+                uint32_t tid=termMap[t];
+                result.push_back({tid,true});
             }
         }
     }
+    return result;
+}
 
-    return out;
-}
-// Decompress ambiguous symbols back to their terminal expansions. 
-// Each ambiguous symbol is replaced by one QSym per terminal byte, 
-// using the remapped terminal IDs, all marked amb=true. 
-static vector<QSym> decompressAmbiguous(const vector<QSym>& cq, 
-    const FMIndex& idx, const vector<uint32_t>& termMap) { 
-    vector<QSym> result; 
-    result.reserve(cq.size()); 
-    for(const auto& qs : cq){ 
-        if(!qs.amb){ result.push_back(qs); } 
-        else { // Expand this symbol back to individual terminals 
-            const auto& exp = idx.exps[qs.sym]; 
-            for(uint8_t t : exp){ 
-                uint32_t tid = termMap[t]; 
-                result.push_back({tid, true}); 
-            } 
-        } 
-    } 
-    return result; 
-}
+// ---------------------------------------------------------------------------
+// Backward search  (v6: LF interval steps use lo/hi directly, not lo-1/hi-1)
+// ---------------------------------------------------------------------------
+//
+// The interval [lo, hi) is now in 0-based row space.
+// Standard FM-index interval LF step for symbol s:
+//   new_lo = C[s] + rankSym(s, lo)
+//   new_hi = C[s] + rankSym(s, hi)
+// where rankSym(s, i) counts occurrences of s in BWT[0..i-1] (exclusive).
+// No adjustment to lo or hi is needed.
 
 static void backwardSearch(const FMIndex& idx, const vector<QSym>& cq,
                             vector<uint64_t>& positions)
 {
     if(cq.empty()) return;
 
-    // Build the terminal sequence of the entire query (for terminal-by-terminal
-    // matching in ambiguous regions). Also record, for each terminal position,
-    // whether it belongs to a non-ambiguous compressed symbol, and if so which
-    // query-symbol index it came from. This lets us detect optimization (3):
-    // hitting a non-ambiguous boundary inside an F-column expansion.
-    //
-    // But actually, a simpler framing: the query is now a sequence of QSyms
-    // where non-ambiguous ones are potentially multi-terminal grammar symbols,
-    // and ambiguous ones are always single terminals. We process them in reverse
-    // order (backward search).
-
-    int Q = (int)cq.size();
-
-    // For a non-ambiguous symbol, its expansion length tells us how many
-    // terminals it covers. For an ambiguous symbol, it's always a single
-    // terminal (expansion size 1).
-
-    // We need a frame that tracks:
-    //   - The current range [lo, hi) in the compressed FM-index
-    //   - qi: the current query symbol index (processing right to left)
-    //   - For ambiguous symbols: which F-column symbol we're inside, and
-    //     how deep we are in its expansion (terminal-by-terminal matching)
-    //   - For non-ambiguous symbols: we match atomically
-    //
-    // State machine per query symbol (right to left):
-    //   If cq[qi].amb == false (non-ambiguous):
-    //     The only valid F-column symbol is cq[qi].sym itself.
-    //     Do a direct LF-step: lo' = C[s] + rank(s, lo-1), hi' = C[s] + rank(s, hi-1)
-    //     Advance qi to qi-1.
-    //
-    //   If cq[qi].amb == true (ambiguous, single terminal):
-    //     We need terminal-by-terminal matching against F-column symbol expansions.
-    //     This is similar to the original code but with optimization (3):
-    //     if while walking inside an F-column expansion we'd next need to match
-    //     a non-ambiguous query symbol, that's a mismatch (prune).
-
-    // We'll track the "offset into the reference" for position calculation.
-    // When we finish matching the entire query and report a hit, the position
-    // in the reference depends on the F-column symbol we're inside and our
-    // depth into it.
+    int Q=(int)cq.size();
 
     struct Frame {
-        uint64_t lo, hi;       // FM-index range (logical rows, 1-based)
+        uint64_t lo, hi;       // FM-index range [lo, hi), 0-based rows
         uint32_t f_sym;        // current F-column symbol
-        uint64_t depth_in_f;   // how deep into f_sym's expansion (from the end)
-        int qi;                // next query symbol index to match (decreasing)
+        uint64_t depth_in_f;   // terminals matched from the right end of f_sym's expansion
+        int qi;                // next query symbol index (decreasing)
     };
 
     vector<Frame> stack;
 
-    // Initialize: match the rightmost query symbol cq[Q-1].
-    const auto& lastQ = cq[Q-1];
+    // Seed: match the rightmost query symbol cq[Q-1] against the F-column.
+    const auto& lastQ=cq[Q-1];
 
     if(!lastQ.amb){
-        // Non-ambiguous: the F-column symbol must be exactly lastQ.sym.
-        // We start fully "inside" this symbol at depth 0 (matched its last terminal),
-        // but since it's non-ambiguous and atomic, we consume it entirely.
-        uint32_t s = lastQ.sym;
-        uint64_t flo = idx.C[s];
-        uint64_t fhi = (s < idx.numSymbols) ? idx.C[s+1] : (idx.compLen+1);
-        if(flo < fhi){
-            uint64_t slen = idx.exps[s].size();
-            // We've matched the entire symbol. depth_in_f = slen-1 means
-            // we're at the beginning of the expansion (fully consumed).
-            stack.push_back({flo, fhi, s, slen-1, Q-2});
+        uint32_t s=lastQ.sym;
+        uint64_t flo=idx.C[s];
+        uint64_t fhi=(s<idx.numSymbols)?idx.C[s+1]:(idx.compLen+1);
+        if(flo<fhi){
+            uint64_t slen=idx.exps[s].size();
+            stack.push_back({flo,fhi,s,slen-1,Q-2});
         }
     } else {
-        // Ambiguous (single terminal): find all F-column symbols whose
-        // expansion ends with this terminal.
-        uint8_t c = idx.exps[lastQ.sym][0]; // single terminal's raw value
-        for(uint32_t s = 1; s <= idx.numSymbols; s++){
-            uint64_t flo = idx.C[s];
-            uint64_t fhi = (s < idx.numSymbols) ? idx.C[s+1] : (idx.compLen+1);
-            uint64_t slen = idx.exps[s].size();
-            if(flo >= fhi || slen == 0) continue;
-            // Check if the last byte of this symbol's expansion matches
-            for (uint32_t d = 0; d < slen; d++){
-                if(idx.exps[s][slen-1-d] == c){
-                    stack.push_back({flo, fhi, s, d, Q-2});
-                }
+        uint8_t c=idx.exps[lastQ.sym][0];
+        for(uint32_t s=1;s<=idx.numSymbols;s++){
+            uint64_t flo=idx.C[s];
+            uint64_t fhi=(s<idx.numSymbols)?idx.C[s+1]:(idx.compLen+1);
+            uint64_t slen=idx.exps[s].size();
+            if(flo>=fhi||slen==0) continue;
+            for(uint32_t d=0;d<slen;d++){
+                if(idx.exps[s][slen-1-d]==c)
+                    stack.push_back({flo,fhi,s,d,Q-2});
             }
         }
     }
 
     while(!stack.empty()){
-        auto [lo, hi, f_sym, depth_in_f, qi] = stack.back();
+        auto [lo,hi,f_sym,depth_in_f,qi]=stack.back();
         stack.pop_back();
 
-        // If we've matched the entire query, report hits.
-        if(qi < 0){
-            uint64_t offset = idx.exps[f_sym].size() - 1 - depth_in_f;
-            for(uint64_t logRow = lo; logRow < hi; logRow++){
-                uint64_t pos = locateRow(idx, logRow);
-                if(pos != UINT64_MAX) positions.push_back(pos + offset);
+        if(qi<0){
+            // Matched the whole query; report one hit per row in [lo, hi).
+            uint64_t offset=idx.exps[f_sym].size()-1-depth_in_f;
+            for(uint64_t row=lo;row<hi;row++){
+                uint64_t pos=locateRow(idx,row);
+                if(pos!=UINT64_MAX) positions.push_back(pos+offset);
             }
             continue;
         }
 
-        const auto& curQ = cq[qi];
-        uint64_t flen = idx.exps[f_sym].size();
-        uint64_t nd = depth_in_f + 1; // next depth if we continue inside f_sym
+        const auto& curQ=cq[qi];
+        uint64_t flen=idx.exps[f_sym].size();
+        uint64_t nd=depth_in_f+1;  // depth after consuming one more terminal
 
         if(!curQ.amb){
-            // Non-ambiguous query symbol: optimization (1) and (2).
-            // This symbol can only appear as a complete unit in the BWT.
-            // So if we're partway through an F-column symbol (nd < flen),
-            // that's optimization (3): mismatch, prune.
-            if(nd < flen){
-                // We haven't exhausted the current F-column symbol, but the
-                // next query symbol is non-ambiguous and can't be a sub-part.
-                // Prune this branch.
-                continue;
-            }
-            // nd == flen: we've exhausted the F-column symbol. Do an LF-step
-            // directly to the non-ambiguous query symbol (optimization 2).
-            uint32_t s = curQ.sym;
-            uint64_t b_lo = idx.C[s] + rankSym(idx, s, lo-1);
-            uint64_t b_hi = idx.C[s] + rankSym(idx, s, hi-1);
-            if(b_lo < b_hi){
-                uint64_t slen = idx.exps[s].size();
-                // Fully consumed this non-ambiguous symbol.
-                stack.push_back({b_lo, b_hi, s, slen-1, qi-1});
+            // Non-ambiguous: must match the whole grammar symbol atomically.
+            // If we haven't exhausted the current F-column symbol yet, prune.
+            if(nd<flen) continue;
+            // F-column symbol exhausted — LF step directly to curQ.sym.
+            // v6: use lo/hi directly (0-based), no -1.
+            uint32_t s=curQ.sym;
+            uint64_t b_lo=idx.C[s]+rankSym(idx,s,lo);
+            uint64_t b_hi=idx.C[s]+rankSym(idx,s,hi);
+            if(b_lo<b_hi){
+                uint64_t slen=idx.exps[s].size();
+                stack.push_back({b_lo,b_hi,s,slen-1,qi-1});
             }
         } else {
             // Ambiguous (single terminal): terminal-by-terminal matching.
-            uint8_t c = idx.exps[curQ.sym][0]; // the raw terminal value
+            uint8_t c=idx.exps[curQ.sym][0];
 
-            if(nd < flen){
+            if(nd<flen){
                 // Still inside the current F-column symbol.
-                // Check if the next byte matches.
-                if(idx.exps[f_sym][flen-1-nd] == c){
-                    stack.push_back({lo, hi, f_sym, nd, qi-1});
-                }
+                if(idx.exps[f_sym][flen-1-nd]==c)
+                    stack.push_back({lo,hi,f_sym,nd,qi-1});
             } else {
-                // Exhausted the F-column symbol; need an LF-step.
-                // Find all F-column symbols whose expansion ends with c.
-                for(uint32_t b = 1; b <= idx.numSymbols; b++){
-                    uint64_t blen = idx.exps[b].size();
-                    if(blen == 0 || idx.exps[b][blen-1] != c) continue;
-                    uint64_t b_lo = idx.C[b] + rankSym(idx, b, lo-1);
-                    uint64_t b_hi = idx.C[b] + rankSym(idx, b, hi-1);
-                    if(b_lo >= b_hi) continue;
-                    stack.push_back({b_lo, b_hi, b, 0, qi-1});
+                // F-column symbol exhausted — LF step for each compatible symbol.
+                // v6: use lo/hi directly (0-based), no -1.
+                for(uint32_t b=1;b<=idx.numSymbols;b++){
+                    uint64_t blen=idx.exps[b].size();
+                    if(blen==0||idx.exps[b][blen-1]!=c) continue;
+                    uint64_t b_lo=idx.C[b]+rankSym(idx,b,lo);
+                    uint64_t b_hi=idx.C[b]+rankSym(idx,b,hi);
+                    if(b_lo>=b_hi) continue;
+                    stack.push_back({b_lo,b_hi,b,0,qi-1});
                 }
             }
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// queryFM  (unchanged except uses updated backwardSearch)
+// ---------------------------------------------------------------------------
 
 static vector<uint64_t> queryFM(const FMIndex& idx, const string& queryStr,
                                   const vector<uint32_t>& ruleNT)
@@ -453,29 +385,26 @@ static vector<uint64_t> queryFM(const FMIndex& idx, const string& queryStr,
         qRem.push_back(rid);
     }
 
-    // Step 1: compress the query (full grammar compression with ambiguity tracking)
-    vector<QSym> cq = compressQuery(qRem, idx, ruleNT);
+    vector<QSym> cq=compressQuery(qRem,idx,ruleNT);
 
-    // Step 2: decompress ambiguous symbols back to terminals.
-    // Build a terminal-value -> remapped-symbol-id map for the decompression.
-    // Terminal values are the raw byte values (1=A, 2=C, 3=G, 4=T).
-    // We need to find the symbol ID for each single-byte expansion.
-    vector<uint32_t> termMap(256, UINT32_MAX);
-    for(uint32_t i = 1; i <= idx.numSymbols; i++){
-        if(idx.exps[i].size() == 1){
-            termMap[idx.exps[i][0]] = i;
-        }
+    vector<uint32_t> termMap(256,UINT32_MAX);
+    for(uint32_t i=1;i<=idx.numSymbols;i++){
+        if(idx.exps[i].size()==1) termMap[idx.exps[i][0]]=i;
     }
-    cq = decompressAmbiguous(cq, idx, termMap);
+    cq=decompressAmbiguous(cq,idx,termMap);
 
     vector<uint64_t> positions;
-    backwardSearch(idx, cq, positions);
+    backwardSearch(idx,cq,positions);
     sort(positions.begin(),positions.end());
     positions.erase(unique(positions.begin(),positions.end()),positions.end());
     while(!positions.empty()&&positions.back()+queryStr.size()>idx.refLen)
         positions.pop_back();
     return positions;
 }
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[])
 {
@@ -485,6 +414,9 @@ int main(int argc, char* argv[])
     cerr<<"Loaded: refLen="<<idx.refLen<<" compLen="<<idx.compLen
         <<" rules="<<idx.rules.size()<<" symbolBits="<<idx.symbolBits
         <<" numSymbols="<<idx.numSymbols<<"\n";
+
+    // C[0]=0, C[1]=1 (one sentinel in F-column).
+    assert(idx.C[0]==0 && idx.C[1]==1);
 
     vector<uint32_t> ruleNT(idx.rules.size(),UINT32_MAX);
     {
@@ -500,8 +432,6 @@ int main(int argc, char* argv[])
             if(it!=expToId.end()) ruleNT[ri]=it->second;
         }
     }
-    // Keep rules around since compressQuery still needs them
-    // (they're used per-query in compressQuery)
 
     ifstream qf(argv[2]);
     if(!qf){cerr<<"Cannot open "<<argv[2]<<"\n";return 1;}

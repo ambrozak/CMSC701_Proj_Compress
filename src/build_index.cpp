@@ -1,24 +1,46 @@
 /**
- * build_index.cpp  —  RePair compression + grammar-compressed FM-index
+ * build_index.cpp  —  RePair compression + grammar-compressed FM-index (v6)
  *
  * Usage:  build_index <in.fa> <symbolBits> <out.idx>
  *
- * Binary layout (version 5):
- *   "FMIDX\x05"  (7 bytes)
+ * Changes from v5 → v6 (all motivated by switching to 0-based row indexing):
+ *
+ *   buildBWT:
+ *     BWT now has compLen+1 entries covering every row 0..compLen.
+ *     Row 0 (compSA[0]=compLen, the sentinel suffix) gets BWT[0]=comp[compLen-1].
+ *     The one row where compSA[i]=0 (the full-text suffix) gets BWT[i]=0
+ *     (the sentinel character, $).  All other rows get comp[compSA[i]-1] as before.
+ *
+ *   buildCTable:
+ *     Plain prefix sum over the full BWT including the one sentinel character.
+ *     That sentinel naturally contributes 1 to every C[s] for s>=1, so
+ *     C[1]=1 without any manual +1 offset.  The old "for C[i]+=1" loop is gone.
+ *
+ *   buildSASamples:
+ *     BWT row index = SA index i directly (0-based, 0..compLen).
+ *     No separate bwtRow counter needed.  Bitvector sized for compLen+1 bits.
+ *
+ *   sentinelRow:
+ *     Removed from the file format.  It was always 0 and never used at query time.
+ *
+ *   Wavelet tree:
+ *     Built over all compLen+1 BWT entries (was compLen).
+ *
+ * Binary layout (version 6):
+ *   "FMIDX\x06"  (7 bytes)
  *   symbolBits   (uint32)
  *   refLen       (uint64)
  *   compLen      (uint64)
  *   numRules     (uint32)
  *   saSampleRate (uint32)
- *   sentinelRow  (uint64, always 0)
- *   numSymbols   (uint32, IDs 1..numSymbols)
+ *   numSymbols   (uint32)   — IDs 1..numSymbols; 0 reserved for sentinel char
  *   For each symbol 1..numSymbols: expLen (uint32) + expBytes (uint8 x expLen)
  *   Rules: numRules x (left, right) as uint32
  *   C table: (numSymbols+1) x uint64, indices 0..numSymbols
  *   SA sample bitvector: bvWords (uint64) then bvWords x uint64
  *   SA sample values:    nVals (uint64) then nVals x uint64
  *   Wavelet tree: symbolBits levels, each: n (uint64) + ceil(n/64) x uint64
- *   (Compressed sequence is NOT stored.)
+ *                 n = compLen+1
  */
 
 #include <algorithm>
@@ -111,7 +133,10 @@ static vector<uint32_t> buildRemap(const vector<vector<uint8_t>>& exps, size_t t
     return remap;
 }
 
-// SA-IS
+// ---------------------------------------------------------------------------
+// SA-IS (unchanged from v5)
+// ---------------------------------------------------------------------------
+
 static void classifySL(const vector<uint32_t>& t, vector<bool>& isS)
 {
     int n=(int)t.size()-1; isS.assign(n+1,false); isS[n]=true;
@@ -176,6 +201,7 @@ static vector<int> sais(const vector<uint32_t>& t,int n,int alpha)
     induceSortL(t,n,alpha,isS,sa); induceSortS(t,n,alpha,isS,sa);
     return sa;
 }
+
 static vector<int> buildCompSA(const vector<uint32_t>& comp, uint32_t numSymbols)
 {
     int n=(int)comp.size(); vector<uint32_t> t(n+1);
@@ -183,30 +209,68 @@ static vector<int> buildCompSA(const vector<uint32_t>& comp, uint32_t numSymbols
     return sais(t,n,(int)numSymbols+1);
 }
 
+// ---------------------------------------------------------------------------
+// BWT  (v6: compLen+1 entries, sentinel char included)
+// ---------------------------------------------------------------------------
+//
+// compSA[0] == compLen always (sentinel suffix is lex-smallest).
+//
+//   BWT[i] = comp[compSA[i]-1]   when compSA[i] > 0
+//           = 0 (sentinel char)  when compSA[i] == 0
+//
+// The row where compSA[i]=0 is the "full-text" suffix; what precedes it
+// in the circular view is t[compLen]=sentinel=0, so BWT[i]=0 is correct.
+// That row is always sampled (0 % SA_SAMPLE_RATE == 0), so locateRow
+// never needs to LF-step through the sentinel character.
+//
+// Removed from v5: sentinelRow output parameter (always 0, never used).
+
 static vector<uint32_t> buildBWT(const vector<int>& compSA,
-                                  const vector<uint32_t>& comp,
-                                  uint64_t& sentinelRow)
+                                  const vector<uint32_t>& comp)
 {
-    int cn=(int)comp.size(); vector<uint32_t> bwt; bwt.reserve(cn);
-    sentinelRow=UINT64_MAX;
-    for(int i=0;i<=cn;i++){
-        int pos=compSA[i];
-        if(pos==cn){assert(i==0);sentinelRow=(uint64_t)bwt.size();continue;}
-        bwt.push_back(pos==0 ? comp[cn-1] : comp[pos-1]);
+    int cn = (int)comp.size();
+    vector<uint32_t> bwt; bwt.reserve(cn + 1);
+    for(int i = 0; i <= cn; i++){
+        int pos = compSA[i];
+        bwt.push_back(pos == 0 ? 0u : (uint32_t)comp[pos - 1]);
     }
-    assert((int)bwt.size()==cn); assert(sentinelRow==0);
+    assert((int)bwt.size() == cn + 1);
     return bwt;
 }
 
+// ---------------------------------------------------------------------------
+// C table  (v6: plain prefix sum, no manual offset)
+// ---------------------------------------------------------------------------
+//
+// C[s] = #{BWT entries with value < s}
+//
+// Because BWT now contains exactly one entry with value 0 (the sentinel
+// character), the prefix sum naturally gives C[1]=1.  Rows are 0-based:
+// row 0 has F-column value 0 ($), real symbols start at row 1.
+//
+// Removed from v5: the "for(i=0..numSymbols) C[i]+=1" loop.
+
 static vector<uint64_t> buildCTable(const vector<uint32_t>& bwt, uint32_t numSymbols)
 {
-    vector<uint64_t> C(numSymbols+2,0);
-    for(uint32_t s:bwt){assert(s>=1&&s<=numSymbols);C[s+1]++;}
-    for(uint32_t i=1;i<=numSymbols+1;i++) C[i]+=C[i-1];
-    for(uint32_t i=0;i<=numSymbols;i++) C[i]+=1;
-    C.resize(numSymbols+1);
+    vector<uint64_t> C(numSymbols + 2, 0);
+    for(uint32_t s : bwt){ assert(s <= numSymbols); C[s + 1]++; }
+    for(uint32_t i = 1; i <= numSymbols + 1; i++) C[i] += C[i-1];
+    C.resize(numSymbols + 1);
     return C;
 }
+
+// ---------------------------------------------------------------------------
+// SA samples  (v6: BWT row index = SA index i, 0-based)
+// ---------------------------------------------------------------------------
+//
+// In v5 a separate bwtRow counter was incremented for every non-sentinel SA
+// entry and used to index the bitvector.  In v6 the SA index i IS the BWT
+// row (rows are 0-based and sentinel is at row 0 but still has an SA entry),
+// so we index the bitvector directly with i.
+//
+// The sentinel suffix (pos == compLen) is still skipped — it has no text
+// position.  The "full-text" suffix (pos == 0) is always sampled and its
+// BWT symbol is 0 (sentinel char); locateRow returns immediately on it.
 
 struct SASamples { vector<uint64_t> bv, vals; };
 
@@ -215,20 +279,21 @@ static SASamples buildSASamples(const vector<int>& compSA,
                                  uint64_t compLen)
 {
     SASamples s;
-    s.bv.assign((compLen+63)/64, 0ULL);
-    uint64_t bwtRow=0;
-    for(int i=0;i<=(int)compLen;i++){
-        int pos=compSA[i];
-        if(pos==(int)compLen){continue;}
-        if((uint64_t)pos%(uint64_t)SA_SAMPLE_RATE==0){
-            s.bv[bwtRow/64]|=1ULL<<(bwtRow%64);
-            s.vals.push_back(compStart[pos]);
+    s.bv.assign((compLen + 1 + 63) / 64, 0ULL);   // rows 0..compLen
+    for(uint64_t i = 0; i <= compLen; i++){
+        uint64_t pos = (uint64_t)compSA[(size_t)i];
+        if(pos == compLen) continue;               // sentinel suffix: no text position
+        if(pos % (uint64_t)SA_SAMPLE_RATE == 0){
+            s.bv[i / 64] |= 1ULL << (i % 64);     // row == i, directly
+            s.vals.push_back(compStart[(size_t)pos]);
         }
-        bwtRow++;
     }
-    assert(bwtRow==compLen);
     return s;
 }
+
+// ---------------------------------------------------------------------------
+// Wavelet tree  (unchanged algorithm; now built over compLen+1 entries)
+// ---------------------------------------------------------------------------
 
 struct WaveletTree{int symbolBits;size_t n;vector<vector<uint64_t>>levels;};
 
@@ -253,6 +318,10 @@ static inline uint32_t bitsNeeded(uint32_t maxVal)
 {
     uint32_t bits=0; while((1u<<bits)<=maxVal) bits++; return bits;
 }
+
+// ---------------------------------------------------------------------------
+// main
+// ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[])
 {
@@ -306,9 +375,11 @@ int main(int argc, char* argv[])
     vector<int> compSA=buildCompSA(seq,numSymbols);
 
     cerr<<"Building BWT...\n";
-    uint64_t sentinelRow=UINT64_MAX;
-    vector<uint32_t> bwt=buildBWT(compSA,seq,sentinelRow);
-    assert(sentinelRow==0);
+    vector<uint32_t> bwt=buildBWT(compSA,seq);
+    // bwt[0] = comp[compLen-1]  (last grammar symbol, BWT of sentinel suffix)
+    // bwt[i] = 0 at exactly one i  (sentinel char, where compSA[i]==0)
+    assert(bwt[0] >= 1);   // sentinel suffix row has a real grammar symbol
+    assert(bwt.size() == compLen + 1);
 
     vector<uint64_t> compStart(compLen+1); compStart[0]=0;
     for(size_t i=0;i<compLen;i++) compStart[i+1]=compStart[i]+lens[seq[i]];
@@ -319,19 +390,27 @@ int main(int argc, char* argv[])
 
     cerr<<"Building C table...\n";
     vector<uint64_t> Ctable=buildCTable(bwt,numSymbols);
+    // C[0]=0, C[1]=1 (one sentinel char in F-column at row 0).
+    assert(Ctable[0]==0);
     assert(Ctable[1]==1);
-    {uint64_t cnt=0;for(uint32_t s:bwt)if(s==numSymbols)cnt++;assert(Ctable[numSymbols]+cnt==compLen+1);}
+    {
+        uint64_t cnt=0;
+        for(uint32_t s:bwt) if(s==numSymbols) cnt++;
+        assert(Ctable[numSymbols]+cnt==compLen+1);  // total rows = compLen+1
+    }
 
     cerr<<"Building wavelet tree...\n";
     WaveletTree wt=buildWT(bwt,symbolBits);
+    assert(wt.n == compLen + 1);
 
     cerr<<"Writing "<<outFile<<"...\n";
     ofstream out(outFile,ios::binary);
     if(!out){cerr<<"Cannot open "<<outFile<<"\n";return 1;}
 
-    out.write("FMIDX\x05\x00",7);
+    // v6 header — sentinelRow field removed
+    out.write("FMIDX\x06\x00",7);
     w32(out,(uint32_t)symbolBits); w64(out,refLen); w64(out,compLen);
-    w32(out,(uint32_t)rules.size()); w32(out,(uint32_t)SA_SAMPLE_RATE); w64(out,sentinelRow);
+    w32(out,(uint32_t)rules.size()); w32(out,(uint32_t)SA_SAMPLE_RATE);
     w32(out,numSymbols);
     for(uint32_t i=1;i<=numSymbols;i++){w32(out,(uint32_t)exps[i].size());out.write((char*)exps[i].data(),exps[i].size());}
     for(auto&r:rules){w32(out,r.left);w32(out,r.right);}
@@ -341,7 +420,7 @@ int main(int argc, char* argv[])
     w64(out,(uint64_t)saSamples.vals.size());
     for(uint64_t v:saSamples.vals) w64(out,v);
     for(int l=0;l<symbolBits;l++){
-        uint64_t nb=(uint64_t)wt.n; w64(out,nb);
+        uint64_t nb=(uint64_t)wt.n; w64(out,nb);  // nb = compLen+1
         size_t words=(nb+63)/64;
         for(size_t wd=0;wd<words;wd++) w64(out,wt.levels[l][wd]);
     }
@@ -350,7 +429,6 @@ int main(int argc, char* argv[])
     cerr<<"\n=== Summary ===\n";
     cerr<<"refLen="<<refLen<<" compLen="<<compLen<<" rules="<<rules.size()<<"\n";
     cerr<<"numSymbols="<<numSymbols<<" (IDs 1.."<<numSymbols<<", symbolBits="<<symbolBits<<")\n";
-    cerr<<"sentinelRow="<<sentinelRow<<"\n";
     cerr<<"saSamples="<<saSamples.vals.size()<<"\n";
     cerr<<"Done.\n";
     return 0;
