@@ -12,6 +12,14 @@ Running this requires:
 
 ## Reproducing results
 
+Clone the github:
+
+```bash
+git clone https://github.com/ambrozak/RPFMIndex.git
+
+cd RPFMIndex
+```
+
 Compile the binaries in [./src](./src) using make:
 
 ```bash
