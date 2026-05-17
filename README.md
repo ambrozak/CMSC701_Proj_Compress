@@ -9,6 +9,7 @@ Running this requires:
  - gcc 11+
  - Make
  - Linux OS
+ - Python 3.11+
 
 ## Reproducing results
 
