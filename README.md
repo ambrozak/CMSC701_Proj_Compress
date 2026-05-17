@@ -35,6 +35,7 @@ Then download and prepare the data in in [./data](./data):
 cd data
 bash get_data.sh
 bash make_queries.sh
+cd ..
 ```
 
 Lastly, navigate to the desired dataset folder in [./eval](./eval) and automatically run the queries.
